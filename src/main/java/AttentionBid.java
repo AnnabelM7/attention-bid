@@ -1,8 +1,11 @@
 private final static String CATEGORY = "Kids";
-private static double bidMultiplier = 1.0;
+private static double thresholdAdjust = 0.0;
+private static double bidAdjust = 1.0;
 
 void main(String[] args) throws Exception {
+    // Total budget given by the system
     long budget = Long.parseLong(args[0]);
+    // Total budget given by the system
     long remaining = budget;
 
     BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
@@ -18,9 +21,12 @@ void main(String[] args) throws Exception {
         line = line.trim();
         if (line.isEmpty()) continue;
 
+        // New round with video and viewer data
         if (line.startsWith("video.") || line.startsWith("viewer.")) {
             remaining = doRound(br, line, remaining, budget);
-        } else if (line.startsWith("S ")) {
+        }
+        // Summary after some rounds
+        else if (line.startsWith("S ")) {
             handleSummary(line, remaining);
         } else {
             System.err.println("Unknown input: " + line);
@@ -30,10 +36,24 @@ void main(String[] args) throws Exception {
 
 }
 
+/**
+ * Processes a single auction round.
+ *
+ * Reads the impression fields, calculates a bid, prints it, then reads
+ * and logs the win/loss result returned by the system.
+ *
+ * @param br        input stream from the auction system
+ * @param line      the first field line already read from stdin
+ * @param remaining budget remaining before this round
+ * @param budget    total initial budget (used for spend-floor logic)
+ * @return          updated remaining budget after the round
+ */
+
 private static long doRound(BufferedReader br, String line, long remaining, long budget) throws Exception {
+    // Convert input line into key value pairs
     Map<String, String> fields = parseFields(line);
 
-    //Calculating bid based on video and ciewer info
+    //Calculating bid based on video and viewer info
     long[] bid = calculateBid(fields, remaining, budget);
     System.out.println(bid[0] + " " + bid[1]);
 
@@ -53,7 +73,29 @@ private static long doRound(BufferedReader br, String line, long remaining, long
     return remaining;
 }
 
+/**
+ * Calculates the (startBid, maxBid) pair for an impression opportunity.
+ *
+ * Scoring factors (multiplicative):
+ *  - Category match:        ×2.0
+ *  - Viewer interest match: ×1.5 / 1.3 / 1.1 (1st / 2nd / 3rd position)
+ *  - Subscriber:            ×1.3
+ *  - High engagement:       ×1.5 (comment/view > 5 %)
+ *  - Medium engagement:     ×1.2 (comment/view > 1 %)
+ *  - Prime age (18–34):     ×1.2
+ *  - Category + sub combo:  ×1.15 extra
+ *
+ * If the final score is below the (adaptive) threshold the round is skipped.
+ * A minimum-spend floor lowers the threshold slightly when the agent risks
+ * finishing below 30 % of total budget spent.
+ *
+ * @param fields    parsed key-value pairs from the auction system
+ * @param remaining budget remaining
+ * @param budget    total initial budget
+ * @return          long[]{startBid, maxBid}, both 0 to pass/skip
+ */
 private static long[] calculateBid(Map<String, String> fields, long remaining, long budget) {
+    // If no money left, do nothing
     if (remaining <= 0) return new long[]{0, 0};
 
     double score = 1.0;
@@ -102,36 +144,41 @@ private static long[] calculateBid(Map<String, String> fields, long remaining, l
         score *= 1.2;
     }
 
-    double spentRatio = 1.0 - ((double) remaining / budget);
-    double spendingPressure = 1.0;
-
-    // Increase bidding
-    if (spentRatio < 0.20) {
-        spendingPressure = 1.25;
-    } else if (spentRatio < 0.30) {
-        spendingPressure = 1.10;
-    }
-    // If we have already spent a lot, reduce bidding a bit
-    else if (spentRatio > 0.60) {
-        spendingPressure = 0.90;
+    // Extra boost if both category and subscription match
+    if (categoryMatch && subscribed) {
+        score *= 1.15;
     }
 
+    // We want to spend at least 30 percent of budget
+    long minSpend = budget * 30 / 100;
+    long spent = budget - remaining;
+    long stillNeeded = minSpend - spent;
 
-    // Skip very low value rounds
-    if (score < 1.0) {
-        return new long[]{1, 2};
+    double threshold = 1.2 + thresholdAdjust;
+    long baseBid = (long)(5 * bidAdjust);
+
+    if (stillNeeded > 0) {
+        threshold = 1.1 + thresholdAdjust;
+        baseBid = (long)(7 * bidAdjust);
     }
 
-    //Final bid calculated from score and multiplier
-    long baseBid = 5;
-    double adjustedMultiplier = bidMultiplier * spendingPressure;
+    // If score is too low, do not bet
+    if (score < threshold) {
+        return new long[]{0, 0};
+    }
 
-    long maxBid = Math.min((long) (baseBid * score * 3 * adjustedMultiplier), remaining);
-    long startBid = Math.min((long) (baseBid * score * adjustedMultiplier), maxBid);
+    long maxBid = Math.min((long) (baseBid * score * 2.5), remaining);
+    long startBid = Math.min((long) (baseBid * score), maxBid);
 
     return new long[]{startBid, maxBid};
 }
 
+/**
+ * Parses a comma-separated "key=value,key=value,..." line into a map.
+ *
+ * @param line raw input line from the auction system
+ * @return     map of field names to their values
+ */
 private static Map<String, String> parseFields(String line) {
     Map<String, String> map = new HashMap<>();
     String[] pairs = line.split(",");
@@ -145,27 +192,56 @@ private static Map<String, String> parseFields(String line) {
 }
 
 
+/**
+ * Processes a summary line from the auction system and self-tunes the
+ * bidding parameters for subsequent rounds.
+ *
+ * Efficiency = points / spent.
+ *  - High efficiency (> 0.40): raise threshold (be more selective),
+ *    lower bids (we do not need to over-pay).
+ *  - Low efficiency (< 0.28):  lower threshold (bid on more), raise bids.
+ *  - Zero spend:               emergency loosening — we are not bidding
+ *    at all and must correct immediately.
+ *
+ * Both parameters are clamped after adjustment to prevent runaway drift.
+ *
+ * @param line      the "S <points> <spent>" line from the system
+ * @param remaining current remaining budget (logged only)
+ */
 private static void handleSummary(String line, long remaining) {
     String[] parts = line.split(" ");
     long points = Long.parseLong(parts[1]);
     long spent = Long.parseLong(parts[2]);
 
-    // Adjust bid multiplier based on how efficient our last 100 rounds were
-    double efficiency;
-    if (spent > 0) {
-        efficiency = (double) points / spent;
-    } else {
-        efficiency = 0;
+    double efficiency = spent > 0 ? (double) points / spent : 0.0;
+
+    if (efficiency > 0.40) {
+        // Performing well — tighten selection criteria and lower spend.
+        thresholdAdjust += 0.03;
+        bidAdjust *= 0.97;
+    } else if (efficiency < 0.28 && spent > 0) {
+        // Poor returns — loosen criteria and bid higher.
+        thresholdAdjust -= 0.03;
+        bidAdjust *= 1.03;
     }
 
-    if (efficiency > 1.5) {
-        // Doing well, bid more aggressively
-        bidMultiplier = Math.min(bidMultiplier * 1.2, 3.0);
-    } else if (efficiency < 0.8) {
-        // Doing poorly, bid more conservatively
-        bidMultiplier = Math.max(bidMultiplier * 0.8, 0.5);
+    if (spent == 0) {
+        // We did not spend anything this period — emergency correction.
+        thresholdAdjust -= 0.04;
+        bidAdjust *= 1.05;
     }
 
-    System.err.println("Summary: points=" + points + " spent=" + spent
-            + " efficiency=" + efficiency + " multiplier=" + bidMultiplier);
+    // Clamp thresholdAdjust to [-0.15, +0.15].
+    if (thresholdAdjust > 0.15) thresholdAdjust = 0.15;
+    if (thresholdAdjust < -0.15) thresholdAdjust = -0.15;
+
+    // Clamp bidAdjust to [0.8, 1.3].
+    if (bidAdjust > 1.3) bidAdjust = 1.3;
+    if (bidAdjust < 0.8) bidAdjust = 0.8;
+
+    System.err.println("Summary: points=" + points
+            + " spent=" + spent
+            + " efficiency=" + efficiency
+            + " thresholdAdjust=" + thresholdAdjust
+            + " bidAdjust=" + bidAdjust);
 }
